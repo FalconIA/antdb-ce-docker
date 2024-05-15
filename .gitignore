@@ -1,0 +1,14 @@
+.idea
+.history
+*_shasums_latest.sh
+*_build_time_latest.sh
+manifest_commands.sh
+hadolint/
+shellcheck/
+push_commands.sh
+adoptopenjdk
+*hotspot.txt
+*openj9.txt
+*.tmp
+*.log
+*.pid

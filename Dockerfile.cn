@@ -1,0 +1,127 @@
+FROM openeuler/openeuler:22.03-lts-sp1
+
+LABEL org.opencontainers.image.authors="Pengxuan Men <pengxuan.men@gmail.com>" maintainer="Pengxuan Men <pengxuan.men@gmail.com>"
+
+ARG ANTDB_VERSION
+
+RUN set -eux; \
+    sed -i -r 's/repo\.openeuler\.org/repo.huaweicloud.com\/openeuler/g' /etc/yum.repos.d/openEuler.repo
+
+# explicitly set user/group IDs
+RUN set -eux; \
+    yum install -y shadow; \
+    yum clean all; \
+    rm -rf /var/cache/ldconfig/* /var/cache/man; \
+    groupadd -r antdb --gid=998; \
+    useradd -r -g antdb --uid=998 --home-dir=/opt/antdb --shell=/bin/bash antdb; \
+    mkdir -p /opt/antdb; \
+    chown -R antdb:antdb /opt/antdb
+
+# grab gosu for easy step-down from root
+# https://github.com/tianon/gosu/releases
+ENV GOSU_VERSION 1.16
+RUN set -eux; \
+    yum install -y curl; \
+    yum clean all; \
+    rm -rf /var/cache/ldconfig/* /var/cache/man; \
+    dpkgArch="$(if [ `arch` = 'x86_64' ]; then echo 'amd64'; else echo `arch`; fi)"; \
+    curl -Lf#S -o /usr/local/bin/gosu "https://gitee.com/falconia/gosu/releases/download/$GOSU_VERSION/gosu-$dpkgArch"; \
+    # curl -Lf#S -o /usr/local/bin/gosu.asc "https://gitee.com/falconia/gosu/releases/download/$GOSU_VERSION/gosu-$dpkgArch.asc"; \
+    # export GNUPGHOME="$(mktemp -d)"; \
+    # gpg --verbose --batch --keyserver hkps://keys.openpgp.org --recv-keys B42F6819007F00F88E364FD4036A9C25BF357DD4; \
+    # gpg --batch --verify /usr/local/bin/gosu.asc /usr/local/bin/gosu; \
+    # rm -rf "$GNUPGHOME" /usr/local/bin/gosu.asc; \
+    chmod +x /usr/local/bin/gosu; \
+    gosu --version; \
+    gosu nobody true
+
+# make the "en_US.UTF-8" locale so postgres will be utf-8 enabled by default
+RUN set -eux; \
+    yum install -y glibc-locale-source; \
+    yum clean all; \
+    rm -rf /var/cache/ldconfig/* /var/cache/man; \
+    rm -f /usr/lib/locale/locale-archive; \
+    if [ ! -f /usr/share/locale/locale.alias ]; then cp /usr/share/X11/locale/locale.alias /usr/share/locale/locale.alias; fi; \
+    localedef -i en_US -c -f UTF-8 -A /usr/share/locale/locale.alias en_US.UTF-8
+ENV LANG en_US.utf8
+
+RUN set -eux; \
+    yum install -y \
+    # install "nss_wrapper" in case we need to fake "/etc/passwd" and "/etc/group" (especially for OpenShift)
+    # https://github.com/docker-library/postgres/issues/359
+    # https://cwrap.org/nss_wrapper.html
+        nss_wrapper \
+        # install "xz-utils" for .sql.xz docker-entrypoint-initdb.d files
+        xz \
+        nc \
+        findutils \
+        util-linux \
+    ; \
+    yum clean all; \
+    rm -rf /var/cache/ldconfig/* /var/cache/man
+
+RUN mkdir /docker-entrypoint-initdb.d
+
+ENV ADB_VERSION=${ANTDB_VERSION}
+
+COPY dist/antdb-ce-${ANTDB_VERSION}.x86_64.tar.gz /tmp/antdb-ce.x86_64.tar.gz
+
+ENV ADB_HOME=/opt/antdb/app/antdb
+ENV PATH ${ADB_HOME}/bin:$PATH
+ENV LD_LIBRARY_PATH ${ADB_HOME}/lib:${ADB_HOME}/lib/postgresql:${ADB_HOME}/lib/third_party:$LD_LIBRARY_PATH
+
+RUN set -eux; \
+    tar -zxf /tmp/antdb-ce.x86_64.tar.gz -C /tmp; \
+    cd /tmp/antdb-ce-*; \
+	sed -i 's/os_version=\$(echo \$os_version | awk '"'"'{print tolower(\$0)}'"'"')/os_version=20/' setup/common/setup-common; \
+    chmod +x *.sh; \
+    ./antdb_install.sh -v; \
+    ./antdb_install.sh -s || cat ./log/install_error_*.log; \
+    cd /tmp; \
+    rm -rf ntdb-*.tar.gz; \
+    postgres -V; \
+    antdb -V
+
+RUN mkdir -p /var/run/postgresql && chown -R antdb:antdb /var/run/postgresql && chmod 2777 /var/run/postgresql
+
+ENV ANTDB_DATA /opt/antdb/data
+# this 777 will be replaced by 700 at runtime (allows semi-arbitrary "--user" values)
+RUN mkdir -p "$ANTDB_DATA" && chown -R antdb:antdb "$ANTDB_DATA" && chmod 777 "$ANTDB_DATA"
+VOLUME /opt/antdb/data
+
+COPY --chmod=755 docker-entrypoint.sh /usr/local/bin/
+RUN ln -s /usr/local/bin/docker-entrypoint.sh / # backwards compat
+ENTRYPOINT ["docker-entrypoint.sh"]
+
+# We set the default STOPSIGNAL to SIGINT, which corresponds to what PostgreSQL
+# calls "Fast Shutdown mode" wherein new connections are disallowed and any
+# in-progress transactions are aborted, allowing PostgreSQL to stop cleanly and
+# flush tables to disk, which is the best compromise available to avoid data
+# corruption.
+#
+# Users who know their applications do not keep open long-lived idle connections
+# may way to use a value of SIGTERM instead, which corresponds to "Smart
+# Shutdown mode" in which any existing sessions are allowed to finish and the
+# server stops when all sessions are terminated.
+#
+# See https://www.postgresql.org/docs/12/server-shutdown.html for more details
+# about available PostgreSQL server shutdown signals.
+#
+# See also https://www.postgresql.org/docs/12/server-start.html for further
+# justification of this as the default value, namely that the example (and
+# shipped) systemd service files use the "Fast Shutdown mode" for service
+# termination.
+#
+STOPSIGNAL SIGINT
+#
+# An additional setting that is recommended for all users regardless of this
+# value is the runtime "--stop-timeout" (or your orchestrator/runtime's
+# equivalent) for controlling how long to wait between sending the defined
+# STOPSIGNAL and sending SIGKILL (which is likely to cause data corruption).
+#
+# The default in most runtimes (such as Docker) is 10 seconds, and the
+# documentation at https://www.postgresql.org/docs/12/server-start.html notes
+# that even 90 seconds may not be long enough in many instances.
+
+EXPOSE 6655
+CMD ["postgres"]
